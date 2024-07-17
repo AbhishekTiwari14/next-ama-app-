@@ -117,3 +117,662 @@
             code: z.string().length(6, 'Verification code must be 6 digits'),
         });
 
+(3) Connecting to MongoDB: 
+-> get MONGO_URI from mongodb website and save it in .env.local
+-> write fxn. to connect to db in src->lib->connectDb.ts: 
+    import mongoose from 'mongoose';
+
+        type ConnectionObject = {
+        isConnected?: number;
+        };
+
+        const connection: ConnectionObject = {};
+
+        async function connectDb(): Promise<void> {
+        // Check if we have a connection to the database or if it's currently connecting
+        if (connection.isConnected) {
+            console.log('Already connected to the database');
+            return;
+        }
+
+        try {
+            // Attempt to connect to the database
+            const db = await mongoose.connect(process.env.MONGODB_URI || '', {});
+
+            connection.isConnected = db.connections[0].readyState;
+
+            console.log('Database connected successfully');
+        } catch (error) {
+            console.error('Database connection failed:', error);
+
+            // Graceful exit in case of a connection error
+            process.exit(1);
+        }
+        }
+
+        export default connectDb;
+
+(4) Set up email verification service with 'Nodemailer' & mailtrap website:
+-> when user signs up, we will send OTP/verifyCode to his email id which he can enter to verify his email id.
+-> get MAILTRAP_USER(username) & MAILTRAP_PASSWORD from mailtrap website & save it in .env.local
+-> write fxn. to send OTP/verifyCode to user in src->lib->mailer.ts:
+    import nodemailer from 'nodemailer';
+        export const sendEmail = async({email, emailType, userId, verifyCode}:any) => {
+            try {
+                
+                var transport = nodemailer.createTransport({
+                    host: "sandbox.smtp.mailtrap.io",
+                    port: 2525,
+                    auth: {
+                    user: process.env.MAILTRAP_USER,
+                    pass: process.env.MAILTRAP_PASSWORD
+                    }
+                });
+
+
+                const mailOptions = {
+                    from: 'abhishek.tiwari2003@gmail.com',
+                    to: email,
+                    subject: "Verify Your Email ID | OTP: ",
+                    html: `<h2>OTP: ${verifyCode}</h2> <p> Thank you for signing up to AMA app.Please verify your email address by entering the above otp in ama application. </p>`
+                }
+
+                const mailresponse = await transport.sendMail
+                (mailOptions);
+                return mailresponse;
+
+            } catch (error:any) {
+                throw new Error(error.message);
+            }
+        }
+
+(5) Create Signup Route:
+-> workflow: check if username is unique (if yes)-> check if email is new(no user with input email exists) (if yes)-> send otp & if email already exists->check if email is verified(if no)-> update password,verifyCode & verifyCodeExpiry for existing user in db & send otp.
+    import connectDb from "@/lib/connectDb";
+        import UserModel from "@/models/User";
+        import { NextRequest, NextResponse } from "next/server";
+        import bcryptjs from "bcryptjs"
+        import { sendEmail } from "@/lib/mailer";
+
+        connectDb();
+
+        export async function POST(request: NextRequest){
+            const {username, email, password} = await request.json();
+            //case1: username is already taken 
+            const existingUsername = await UserModel.findOne({username, isVerified: true});
+            if(existingUsername){
+                return NextResponse.json({
+                    success: false,
+                    message: 'Username is already taken'
+                }, {status: 400})
+            }
+            const existingEmail = await UserModel.findOne({email});
+            let otp = Math.floor(100000 + Math.random() * 900000).toString();
+            if(existingEmail){
+                if(existingEmail.isVerified){
+                    return NextResponse.json({
+                        success: false,
+                        message: 'User already exists with this email'
+                    }, {status: 400})
+                }
+                else{
+                    const hashedPassword = await bcryptjs.hash(password, 10);
+                    existingEmail.password = hashedPassword;
+                    existingEmail.verifyCode = otp;
+                    existingEmail.verifyCodeExpiry = new Date(Date.now() + 3600000); //1hr from now
+                    await existingEmail.save();
+                }
+            }
+            else{
+                const hashedPassword = await bcryptjs.hash(password, 10);
+                const codeExpiryTime = new Date(Date.now() + 3600000);
+                const newUser = new UserModel({
+                    username, 
+                    email,
+                    password: hashedPassword,
+                    verifyCode: otp,
+                    verifyCodeExpiry: codeExpiryTime, 
+                    isVerified: false,
+                    isAcceptingMessages: true,
+                    messages: []
+                })
+                await newUser.save();
+            }
+
+            // send verification email 
+            try {
+                await sendEmail({email, verifyCode: otp });
+                return NextResponse.json({
+                    success: true,
+                    message: "user created successfully" 
+                }, {status: 200})
+            } catch (error: any) {
+                return  NextResponse.json({error: error.message}, {status: 500})
+            }           
+        }
+
+(6) Test signup api endpoint with postman
+
+(7) Use next-auth/auth-js-v4 for signin:
+-> api->auth->[...nextauth] -> create files options.ts & route.ts: 
+
+-> In options.ts: providers->credentialsProvider & authorize fxn.; callbacks, session, secret, pages:
+    import { NextAuthOptions } from 'next-auth';
+        import CredentialsProvider from 'next-auth/providers/credentials';
+        import bcryptjs from 'bcryptjs';
+        import UserModel from '@/models/User';
+        import connectDb from '@/lib/connectDb';
+
+        export const authOptions: NextAuthOptions = {
+        providers: [
+            CredentialsProvider({
+            id: 'credentials',
+            name: 'Credentials',
+            credentials: {
+                email: { label: 'Email/Username', type: 'text' },
+                password: { label: 'Password', type: 'password' },
+            },
+            async authorize(credentials: any): Promise<any> {
+                await connectDb();
+                try {
+                const user = await UserModel.findOne({    //user can log in via either email or username
+                    $or: [
+                    { email: credentials.identifier },
+                    { username: credentials.identifier },
+                    ],
+                });
+                if (!user) {
+                    throw new Error('No user found with this email');
+                }
+                if (!user.isVerified) {
+                    throw new Error('Please verify your account before logging in');
+                }
+                const isPasswordCorrect = await bcryptjs.compare(
+                    credentials.password,
+                    user.password
+                );
+                if (isPasswordCorrect) {
+                    return user;  //if user enters correct credentials, then we just return user in next-auth
+                } else {
+                    throw new Error('Incorrect password');
+                }
+                } catch (err: any) {
+                throw new Error(err);
+                }
+            },
+            }),
+        ],
+        callbacks: {
+            async jwt({ token, user }) {
+            if (user) {       //below, we are just storing user data in token so that we can access data of logged in user via token without making server requests
+                token._id = user._id?.toString(); // Convert ObjectId to string
+                token.isVerified = user.isVerified;
+                token.isAcceptingMessages = user.isAcceptingMessages;
+                token.username = user.username;
+            }
+            return token;
+            },
+            async session({ session, token }) {
+            if (token) {
+                //below, we are just storing user data in session so that we can access data of logged in user via session without making server requests
+                session.user._id = token._id;
+                session.user.isVerified = token.isVerified;
+                session.user.isAcceptingMessages = token.isAcceptingMessages;
+                session.user.username = token.username;
+            }
+            return session;
+            },
+        },
+        session: {
+            strategy: 'jwt',
+        },
+        secret: process.env.NEXTAUTH_SECRET,
+        pages: {
+            signIn: '/sign-in',  //default sigin in page is localhost:3000/api/auth/sigIn but we are changing it to localhost:3000/sign-in
+        },
+        };
+
+-> In types->next-auth.d.ts: redefine next-auth types for session, user & jwt:
+    import 'next-auth';
+
+        declare module 'next-auth' {
+        interface Session {
+            user: {
+            _id?: string;
+            isVerified?: boolean;
+            isAcceptingMessages?: boolean;
+            username?: string;
+            } & DefaultSession['user'];
+        }
+
+        interface User {
+            _id?: string;
+            isVerified?: boolean;
+            isAcceptingMessages?: boolean;
+            username?: string;
+        }
+        }
+
+        declare module 'next-auth/jwt' {
+        interface JWT {
+            _id?: string;
+            isVerified?: boolean;
+            isAcceptingMessages?: boolean;
+            username?: string;
+        }
+        }
+
+-> In src->middleware.ts: Write middleware to manage where does which route gets redirected to & when: 
+    import { NextRequest, NextResponse } from 'next/server';
+        import { getToken } from 'next-auth/jwt';
+        export { default } from 'next-auth/middleware';
+
+        export const config = {
+        matcher: ['/dashboard/:path*', '/sign-in', '/sign-up', '/', '/verify/:path*'],
+        };
+
+        export async function middleware(request: NextRequest) {
+        const token = await getToken({ req: request });
+        const url = request.nextUrl;
+
+        // Redirect to dashboard if the user is already authenticated
+        // and trying to access sign-in, sign-up, or home page
+        if (
+            token &&
+            (url.pathname.startsWith('/sign-in') ||
+            url.pathname.startsWith('/sign-up') ||
+            url.pathname.startsWith('/verify') ||
+            url.pathname === '/')
+        ) {
+            return NextResponse.redirect(new URL('/dashboard', request.url));
+        }
+
+        if (!token && url.pathname.startsWith('/dashboard')) {
+            return NextResponse.redirect(new URL('/sign-in', request.url));
+        }
+
+        return NextResponse.next();
+        }
+    
+-> In src->context->AuthProvider.ts: Create a client component & wrap children with SessionProvider: 
+'use client';
+    import { SessionProvider } from 'next-auth/react';
+        export default function AuthProvider({
+        children,
+        }: {
+        children: React.ReactNode;
+        }) {
+        return (
+            <SessionProvider>
+            {children}
+            </SessionProvider>
+        );
+        }
+
+-> In app->layout.tsx: wrap body with <AuthProvider> :
+    return (
+        <html lang="en">
+        <AuthProvider>
+            <body className={inter.className}>{children}</body>
+        </AuthProvider> 
+        </html>
+    );
+
+(8) Writing route to verify that username is unique in api-> check-usersname-unique-> route.ts:
+    import connectDb from "@/lib/connectDb";
+        import UserModel from "@/models/User";
+        import { usernameValidation } from "@/schemas/signupSchema";
+        import {z} from "zod"
+
+        const UsernameQuerySchema = z.object({
+            username: usernameValidation
+        })
+
+        export async function GET(request: Request){
+            await connectDb();
+
+            try {
+                //we will get user's input username as url query param: ex. localhost:3000/c-u-u?username=abhishek
+                const { searchParams } = new URL(request.url);
+                const queryParam = {
+                    username: searchParams.get('username')
+                }
+                //validate with zod
+                const result = UsernameQuerySchema.safeParse(queryParam);
+                
+                if(!result.success){
+                    const usernameErrors = result.error.format().username?._errors || [];
+                    return Response.json({
+                        success: false,
+                        message: usernameErrors?.length>0? usernameErrors.join(', ') : "Invalid query param" 
+                    }, {status: 400});
+                }
+
+                const {username} = result.data;
+                const existingVerifiedUser = await UserModel.findOne({username, isVerified: true });
+                if(existingVerifiedUser){
+                    return Response.json({
+                        success: false,
+                        message: "Username already exists" 
+                    }, {status: 400});
+                }
+
+                return Response.json({
+                    success: true,
+                    message: "username is unique" 
+                }, {status: 201});
+
+
+            } catch (error) {
+                console.log("error checking username");
+                return Response.json({
+                    success: false,
+                    message: "error checking username"
+                }, {status: 500})
+            }
+        }
+
+(9) Test check0-username-unique api endpoint with postman (ex. http://localhost:3000/api/check-username-unique?username=chandu will check if username 'chandu' is unique or is it already taken(ie, already exists as a verified user's username in our DB))
+
+(10) Writing route to verify email(using otp) in api->verify-code-> route.ts:
+    import connectDb from "@/lib/connectDb";
+        import UserModel from "@/models/User";
+        import { usernameValidation } from "@/schemas/signupSchema";
+        import {date, z} from "zod"
+
+        export async function POST(request: Request){
+            await connectDb();
+
+            try {
+                const {username, otp} = await request.json();
+                const user = await UserModel.findOne({username});
+                if(!user){
+                    return Response.json({
+                        success: false,
+                        message: "user not found"
+                    }, {status: 500})
+                }
+                
+                const isOTPCorrect = user.verifyCode === otp;
+                const isOTPValid = new Date(user.verifyCodeExpiry) > new Date();
+
+                if(isOTPValid && isOTPCorrect){
+                    user.isVerified = true;
+                    await user.save();
+                    return Response.json({
+                        success: true,
+                        message: "Account verfied successfully"
+                    }, {status: 200});
+                }
+                else if(!isOTPValid){
+                    return Response.json({
+                        success: false,
+                        message: "Verification code has expired. Please sign up again to get a new code"
+                    }, {status: 400})
+                }
+                else{
+                    return Response.json({
+                        success: false,
+                        message: "incorrect otp"
+                    }, {status: 400})
+                }
+
+
+            } catch (error) {
+                console.log("error verifying otp");
+                return Response.json({
+                    success: false,
+                    message: "error verifying otp"
+                }, {status: 500})
+            }
+        }
+
+(11)Write route to check(GET)/change(POST) if user is accepting messages:
+-> Get seesion from "const session = await getServerSession(authOptions);"
+-> user can be accessed from session as "session.user";
+-> in api->accept-messages->route.ts:
+    import connectDb from "@/lib/connectDb";
+        import { getServerSession, User } from "next-auth";
+        import { authOptions } from "../auth/[...nextauth]/options";
+        import UserModel from "@/models/User";
+
+
+        export async function POST(request: Request){
+            await connectDb();
+
+            const session = await getServerSession(authOptions);
+            const user: User = session?.user;
+            if (!session || !session.user) {
+                return Response.json(
+                { success: false, message: 'Not authenticated' },
+                { status: 401 }
+                );
+            }
+
+            const userId = user._id;
+            const { acceptMessages} = await request.json();
+            try {
+                // Update the user's message acceptance status
+            const updatedUser = await UserModel.findByIdAndUpdate(
+                userId,
+                { isAcceptingMessages: acceptMessages },
+                { new: true }   //this makes sure that updateUser will store updated value
+            );
+            if (!updatedUser) {
+                // User not found
+                return Response.json(
+                {
+                    success: false,
+                    message: 'Unable to find user to update message acceptance status',
+                },
+                { status: 404 }
+                );
+            }
+        
+            // Successfully updated message acceptance status
+            return Response.json(
+                {
+                success: true,
+                message: 'Message acceptance status updated successfully',
+                updatedUser,
+                },
+                { status: 200 }
+            );
+
+            } catch (error) {
+                console.error('Error updating message acceptance status:', error);
+                return Response.json(
+                    { success: false, message: 'Error updating message acceptance status' },
+                    { status: 500 }
+                );
+            }
+        }
+
+        export async function GET(request: Request) {
+            // Connect to the database
+            await connectDb();
+        
+            // Get the user session
+            const session = await getServerSession(authOptions);
+            const user = session?.user;
+        
+            // Check if the user is authenticated
+            if (!session || !user) {
+            return Response.json(
+                { success: false, message: 'Not authenticated' },
+                { status: 401 }
+            );
+            }
+        
+            try {
+            // Retrieve the user from the database using the ID
+            const foundUser = await UserModel.findById(user._id);
+        
+            if (!foundUser) {
+                // User not found
+                return Response.json(
+                { success: false, message: 'User not found' },
+                { status: 404 }
+                );
+            }
+        
+            // Return the user's message acceptance status
+            return Response.json(
+                {
+                success: true,
+                isAcceptingMessages: foundUser.isAcceptingMessages,
+                },
+                { status: 200 }
+            );
+            } catch (error) {
+            console.error('Error retrieving message acceptance status:', error);
+            return Response.json(
+                { success: false, message: 'Error retrieving message acceptance status' },
+                { status: 500 }
+            );
+            }
+        }
+
+(12) Write route to retrieve all messages sent to the user:
+-> messages is an array, so we write aggregation pipeline for getting messages. Stage 1: match user by id, S2: unwind the messages array, S3: sort the messages with latest message being first, S4: group(wind) the messages based on id and push them in messages.
+-> in api->get-messages->route.ts:
+    import connectDb from "@/lib/connectDb";
+        import { getServerSession, User } from "next-auth";
+        import { authOptions } from "../auth/[...nextauth]/options";
+        import UserModel from "@/models/User";
+        import mongoose from "mongoose";
+
+
+        export async function GET(request: Request){
+            await connectDb();
+
+            const session = await getServerSession(authOptions);
+            const user: User = session?.user;
+            if (!session || !session.user) {
+                return Response.json(
+                { success: false, message: 'Not authenticated' },
+                { status: 401 }
+                );
+            }
+
+            const userId = new mongoose.Types.ObjectId(user._id);
+            try {
+                const user = await UserModel.aggregate([
+                    { $match: { _id: userId } },
+                    { $unwind: '$messages' },
+                    { $sort: { 'messages.createdAt' : -1 } },
+                    { $group: {_id: '$_id', messages: { $push: "$messages" }} }
+                ]).exec()
+
+                if (!user || user.length === 0) {
+                    return Response.json(
+                    { message: 'User not found', success: false },
+                    { status: 404 }
+                    );
+                }
+
+                return Response.json(
+                    { messages: user[0].messages },
+                    {
+                    status: 200,
+                    }
+                );
+            } catch (error) {
+                console.error('An unexpected error occurred:', error);
+                return Response.json(
+                    { message: 'Internal server error', success: false },
+                    { status: 500 }
+                );
+            }
+        }
+
+(13) Write route to handle when a new message is sent to user in api->send-message->route.ts:
+    import UserModel from '@/models/User';
+        import connectDb from '@/lib/connectDb';
+        import { Message } from '@/models/User';
+
+        export async function POST(request: Request) {
+        await connectDb();
+        const { username, content } = await request.json();
+
+        try {
+            const user = await UserModel.findOne({ username }).exec();
+
+            if (!user) {
+            return Response.json(
+                { message: 'User not found', success: false },
+                { status: 404 }
+            );
+            }
+
+            // Check if the user is accepting messages
+            if (!user.isAcceptingMessages) {
+            return Response.json(
+                { message: 'User is not accepting messages', success: false },
+                { status: 403 } // 403 Forbidden status
+            );
+            }
+
+            const newMessage = { content, createdAt: new Date() };
+
+            // Push the new message to the user's messages array
+            user.messages.push(newMessage as Message);
+            await user.save();
+
+            return Response.json(
+            { message: 'Message sent successfully', success: true },
+            { status: 201 }
+            );
+        } catch (error) {
+            console.error('Error adding message:', error);
+            return Response.json(
+            { message: 'Internal server error', success: false },
+            { status: 500 }
+            );
+        }
+        } 
+
+(14) Integrate AI in api->suggest-messages->route.ts:
+    import OpenAI from 'openai';
+        import { OpenAIStream, StreamingTextResponse } from 'ai';
+        import { NextResponse } from 'next/server';
+
+        const openai = new OpenAI({
+        apiKey: process.env.OPENAI_API_KEY,
+        });
+
+        export const runtime = 'edge';
+
+        export async function POST(req: Request) {
+        try {
+            const prompt =
+            "Create a list of three open-ended and engaging questions formatted as a single string. Each question should be separated by '||'. These questions are for an anonymous social messaging platform, like Qooh.me, and should be suitable for a diverse audience. Avoid personal or sensitive topics, focusing instead on universal themes that encourage friendly interaction. For example, your output should be structured like this: 'What’s a hobby you’ve recently started?||If you could have dinner with any historical figure, who would it be?||What’s a simple thing that makes you happy?'. Ensure the questions are intriguing, foster curiosity, and contribute to a positive and welcoming conversational environment.";
+
+            const response = await openai.completions.create({
+            model: 'gpt-3.5-turbo-instruct',
+            max_tokens: 400,
+            stream: true,
+            prompt,
+            });
+
+            const stream = OpenAIStream(response);
+            
+            
+            return new StreamingTextResponse(stream);
+        } catch (error) {
+            if (error instanceof OpenAI.APIError) {
+            // OpenAI API error handling
+            const { name, status, headers, message } = error;
+            return NextResponse.json({ name, status, headers, message }, { status });
+            } else {
+            // General error handling
+            console.error('An unexpected error occurred:', error);
+            throw error;
+            }
+        }
+        }
+
+FRONTEND::
+
+(15)
+
